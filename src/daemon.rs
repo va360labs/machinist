@@ -2791,6 +2791,87 @@ mod tests {
         assert_eq!(after_claim_pause[0].next_due, utc("2026-07-18T12:05:00Z"));
     }
 
+    /// Replays the schedule branch of the daemon loop (`src/daemon.rs`, the
+    /// `schedule_interval` tick) with fixed clocks for issue #1. A first pause
+    /// signal is consumed at 12:02:10, which moves the every-minute cursor to
+    /// 12:03. Optionally a second, late pause signal is stored after that
+    /// `swap(false)`, exactly as a racing `maintain_owner_lease` renewal would.
+    /// Returns the `scheduled_at` of every scheduled task and the next due
+    /// time after the 12:03:01 tick.
+    fn tick_after_pause(duplicate_pause_signal: bool) -> (Vec<String>, DateTime<Utc>) {
+        let temp = tempfile::tempdir().unwrap();
+        let targets = scheduled_targets(temp.path(), "* * * * *", chrono_tz::UTC);
+        let owner = DaemonOwner {
+            id: "paused-owner".to_owned(),
+            pid: std::process::id(),
+        };
+        let mut ledger = Ledger::open(&temp.path().join("ledger.db")).unwrap();
+        ledger.register_daemon_owner(&owner.id, owner.pid).unwrap();
+        let schedules = initialize_schedules(
+            &mut ledger,
+            &targets,
+            utc("2026-07-18T12:00:10Z"),
+            &owner.id,
+        );
+        assert_eq!(schedules[0].next_due, utc("2026-07-18T12:01:00Z"));
+
+        let resumed_after_pause = AtomicBool::new(true);
+        let tick = |ledger: &mut Ledger, now: DateTime<Utc>| {
+            let mut schedules = if resumed_after_pause.swap(false, Ordering::AcqRel) {
+                initialize_schedules_after_pause(ledger, &targets, now, &owner.id)
+            } else {
+                initialize_schedules(ledger, &targets, now, &owner.id)
+            };
+            evaluate_schedules(ledger, &mut schedules, now);
+            schedules
+        };
+        let resumed = tick(&mut ledger, utc("2026-07-18T12:02:10Z"));
+        assert_eq!(resumed[0].next_due, utc("2026-07-18T12:03:00Z"));
+        if duplicate_pause_signal {
+            resumed_after_pause.store(true, Ordering::Release);
+        }
+
+        let next = tick(&mut ledger, utc("2026-07-18T12:03:01Z"));
+        let scheduled = ledger
+            .tasks()
+            .unwrap()
+            .into_iter()
+            .filter(|task| task.kind == "scheduled")
+            .map(|task| {
+                let payload: serde_json::Value =
+                    serde_json::from_str(task.payload.as_deref().unwrap()).unwrap();
+                payload["scheduled_at"].as_str().unwrap().to_owned()
+            })
+            .collect();
+        (scheduled, next[0].next_due)
+    }
+
+    /// Issue #1, consequence: a duplicate pause signal (both renewals of a
+    /// stale lease returned `true`, see
+    /// `concurrent_renewals_of_a_stale_owner_currently_both_report_resume` in
+    /// `tests/storage.rs`) arrives after the loop already consumed the first
+    /// one. On the next tick `initialize_schedule_cursor_after_pause` discards
+    /// the stored 12:03 cursor (it is not after 12:03:01 and the resume flag
+    /// ignores the live current owner) and reschedules to 12:04, so the 12:03
+    /// occurrence is silently skipped. RESULT: the bug is real; this pins the
+    /// current behaviour. Once fixed, 12:03 must be enqueued as in the control.
+    #[test]
+    fn duplicate_late_pause_signal_currently_skips_the_due_scheduled_occurrence() {
+        let (scheduled, next_due) = tick_after_pause(true);
+        assert!(scheduled.is_empty(), "unexpected occurrences: {scheduled:?}");
+        assert_eq!(next_due, utc("2026-07-18T12:04:00Z"));
+    }
+
+    /// Control for issue #1: the same ticks without the duplicate signal
+    /// enqueue the 12:03 occurrence, so the loss above comes only from the
+    /// duplicated pause signal.
+    #[test]
+    fn single_pause_signal_enqueues_the_due_scheduled_occurrence() {
+        let (scheduled, next_due) = tick_after_pause(false);
+        assert_eq!(scheduled, vec!["2026-07-18T12:03:00Z".to_owned()]);
+        assert_eq!(next_due, utc("2026-07-18T12:04:00Z"));
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn daemon_run_keeps_an_active_worker_and_claims_later_work_after_a_stale_heartbeat() {
