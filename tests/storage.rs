@@ -1022,6 +1022,74 @@ fn stale_daemon_owner_can_only_be_renewed_by_its_registered_identity_and_pid() {
     assert!(heartbeat > 0);
 }
 
+/// Concurrent stale-owner renewals (issue #1).
+///
+/// `renew_daemon_owner` reads `heartbeat_at` and then updates it in two
+/// separate autocommit statements. The main loop and `maintain_owner_lease`
+/// each renew through their own `Ledger`. A third connection holds the write
+/// lock (`BEGIN IMMEDIATE`) so both reads run first, see the stale heartbeat,
+/// and both updates queue behind the busy timeout. When the lock is released
+/// both updates commit and BOTH callers report "resumed after a pause".
+///
+/// RESULT: the bug is real at the database level, between the SELECT and the
+/// UPDATE of `renew_daemon_owner`. This test pins the current behaviour so CI
+/// stays green; once renewal reads and writes inside an immediate transaction
+/// the expected count must change to 1.
+#[test]
+fn concurrent_renewals_of_a_stale_owner_currently_both_report_resume() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("ledger.db");
+    let pid = std::process::id();
+    Ledger::open(&path)
+        .unwrap()
+        .register_daemon_owner("sleeping-owner", pid)
+        .unwrap();
+    Connection::open(&path)
+        .unwrap()
+        .execute(
+            "UPDATE daemon_owners SET heartbeat_at = 0 WHERE owner_id = ?1",
+            ["sleeping-owner"],
+        )
+        .unwrap();
+    let main_loop = Ledger::open(&path).unwrap();
+    let lease_task = Ledger::open(&path).unwrap();
+
+    let lock = Connection::open(&path).unwrap();
+    lock.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+    let ready = Arc::new(Barrier::new(3));
+    let renewals = [main_loop, lease_task].map(|mut ledger| {
+        let ready = ready.clone();
+        thread::spawn(move || {
+            ready.wait();
+            ledger.renew_daemon_owner("sleeping-owner", pid)
+        })
+    });
+    ready.wait();
+    // Reads are not blocked in WAL mode; leave ample time for both to finish
+    // and park in the UPDATE busy wait (5 s timeout) before releasing.
+    thread::sleep(Duration::from_millis(500));
+    lock.execute_batch("COMMIT").unwrap();
+
+    let resumed = renewals
+        .map(|renewal| renewal.join().unwrap().unwrap())
+        .into_iter()
+        .filter(|resumed| *resumed)
+        .count();
+    assert_eq!(
+        resumed, 2,
+        "both concurrent renewals observed the stale heartbeat and reported a resume"
+    );
+    let heartbeat: i64 = lock
+        .query_row(
+            "SELECT heartbeat_at FROM daemon_owners WHERE owner_id = ?1",
+            ["sleeping-owner"],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(heartbeat > 0);
+}
+
 #[test]
 fn owner_lease_is_checked_after_waiting_for_the_claim_lock() {
     let temp = tempfile::tempdir().unwrap();
